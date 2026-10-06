@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>写真対応 給料計算機</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f3f5f7;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20252a;padding:16px}
+main{max-width:720px;margin:auto}
+.card{background:#fff;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 3px 14px #0001}
+h1{font-size:24px;margin:4px 0 16px}
+h2{font-size:18px;margin:0 0 12px}
+label{display:block;font-size:13px;color:#606870;margin:8px 0 5px}
+input,button{font:inherit}
+input[type=number],input[type=time],input[type=date]{width:100%;padding:11px;border:1px solid #ccd2d8;border-radius:10px;font-size:16px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+button{border:0;border-radius:10px;padding:11px 14px;cursor:pointer}
+.primary{background:#111;color:#fff;width:100%;margin-top:10px}
+.secondary{background:#e9edf1}
+.danger{background:#ffe7e7;color:#9b0000}
+.file{display:block;border:2px dashed #c8ced5;border-radius:12px;padding:18px;text-align:center;cursor:pointer}
+.file input{display:none}
+.preview{max-width:100%;max-height:420px;display:block;margin:12px auto;border-radius:10px;object-fit:contain}.hint{background:#eef6ff;border-radius:10px;padding:10px;font-size:13px;line-height:1.6}
+.status{font-size:13px;color:#626a72;margin-top:8px}
+.row{border:1px solid #e1e5e9;border-radius:12px;padding:12px;margin:10px 0}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.result{font-size:28px;font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:8px;border-bottom:1px solid #eee;text-align:left}
+.note{font-size:12px;color:#666;line-height:1.5}
+@media(max-width:430px){.grid{grid-template-columns:1fr}.result{font-size:24px}}
+</style>
+</head>
+<body>
+<main>
+<h1>💰 写真対応 給料計算機</h1>
+
+<section class="card">
+<h2>① 給料設定</h2>
+<div><label>勤務表の年月（写真の日付補完用）</label><input id="sheetMonth" type="month"></div>
+<div><label>基本時給（8:00以降）</label><input id="base" type="number" value="1140"></div>
+<div><label>8:00より前</label><input id="early" type="number" value="1425"></div>
+<div><label>土日祝の加算</label><input id="weekend" type="number" value="0"></div>
+<div><label>休憩（各勤務・分）</label><input id="break" type="number" value="0"></div>
+</div>
+</section>
+
+<section class="card">
+<h2>② 勤務表の写真を読み取る</h2>
+<label class="file">
+  <input id="photo" type="file" accept="image/*">
+  📷 写真を選択
+</label>
+<img id="preview" class="preview" hidden>
+<div class="actions">
+<button id="ocr" class="primary" type="button" disabled>写真から時刻を読み取る</button>
+</div>
+<div id="status" class="status">写真を選ぶと読み取りできます。</div>
+<p class="hint">読み取りやすくするコツ：勤務表を明るい場所で、真上から、表全体が入るように撮影してください。文字が小さい場合は、時刻欄を拡大して撮ると改善しやすいです。</p><p class="note">読み取り結果は必ず確認してください。写真全体から時刻を探すため、表の配置によっては別の数字を拾うことがあります。</p>
+</section>
+
+<section class="card">
+<h2>③ 読み取った勤務時間</h2>
+<div id="rows"></div>
+<button id="add" class="secondary" type="button">＋ 勤務日を追加</button>
+<button id="calc" class="primary" type="button">給料を計算する</button>
+</section>
+
+<section id="result" class="card" hidden></section>
+</main>
+
+<script type="module">
+const $=s=>document.querySelector(s);
+const rows=$("#rows"), photo=$("#photo"), preview=$("#preview"), ocr=$("#ocr"), status=$("#status");
+let selectedFile=null;
+let ocrWorkerPromise=null;
+
+function addRow(start="",end="",date=""){
+  const d=document.createElement("div");
+  d.className="row";
+  d.innerHTML=`
+    <div class="grid">
+      <div><label>日付（任意）</label><input class="date" type="date" value="${date}"></div>
+      <div><label>出勤</label><input class="start" type="time" value="${start}"></div>
+      <div><label>退勤</label><input class="end" type="time" value="${end}"></div>
+    </div>
+    <button class="danger remove" type="button" style="margin-top:10px">削除</button>`;
+  d.querySelector(".remove").addEventListener("click",()=>d.remove());
+  rows.appendChild(d);
+}
+addRow();
+const monthInput=$("#sheetMonth");
+if(monthInput){
+  const now=new Date();
+  monthInput.value=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}`;
+}
+
+photo.addEventListener("change",()=>{
+  selectedFile=photo.files?.[0]||null;
+  if(!selectedFile){ocr.disabled=true;return}
+  preview.src=URL.createObjectURL(selectedFile);
+  preview.hidden=false;
+  ocr.disabled=false;
+  status.textContent="写真を選択しました。「写真から時刻を読み取る」を押してください。";
+});
+
+function normalizeText(s){
+  return s.replace(/[：;]/g, ":")
+          .replace(/[OoО]/g, "0")
+          .replace(/[Il|]/g, "1")
+          .replace(/[．。]/g, ".");
+}
+function extractTimes(text){
+  const t=normalizeText(text);
+  const found=[];
+  // 時刻のコロンが認識されたものを優先し、日付などの数字を時刻と誤認しにくくする
+  const re=/(?<!\d)([01]?\d|2[0-3])\s*[:.]\s*([0-5]\d)(?!\d)/g;
+  let m;
+  while((m=re.exec(t))){
+    const v=`${String(Number(m[1])).padStart(2,"0")}:${m[2]}`;
+    if(!found.includes(v)) found.push(v);
+  }
+  return found;
+}
+async function getOCRWorker(){
+  if(!ocrWorkerPromise){
+    ocrWorkerPromise=(async()=>{
+      const mod=await import("https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/+esm");
+      const worker=await mod.createWorker("eng", 1, {
+        logger:m=>{
+          if(m.status==="recognizing text"){
+            status.textContent=`写真を読み取り中… ${Math.round((m.progress||0)*100)}%`;
+          } else if(m.status==="loading language traineddata"){
+            status.textContent=`文字認識の準備中… ${Math.round((m.progress||0)*100)}%`;
+          }
+        }
+      });
+      await worker.setParameters({
+        tessedit_char_whitelist: "0123456789:.",
+        preserve_interword_spaces: "1"
+      });
+      return worker;
+    })().catch(err=>{
+      ocrWorkerPromise=null;
+      throw err;
+    });
+  }
+  return ocrWorkerPromise;
+}
+async function prepareImage(file){
+  const img=new Image();
+  const url=URL.createObjectURL(file);
+  try{
+    await new Promise((resolve,reject)=>{
+      img.onload=resolve;
+      img.onerror=reject;
+      img.src=url;
+    });
+    // Enlarge small images and improve contrast before OCR
+    const scale=Math.min(3, Math.max(1.5, 1800/Math.max(img.naturalWidth,img.naturalHeight)));
+    const canvas=document.createElement("canvas");
+    canvas.width=Math.round(img.naturalWidth*scale);
+    canvas.height=Math.round(img.naturalHeight*scale);
+    const ctx=canvas.getContext("2d",{willReadFrequently:true});
+    ctx.drawImage(img,0,0,canvas.width,canvas.height);
+    const data=ctx.getImageData(0,0,canvas.width,canvas.height);
+    for(let i=0;i<data.data.length;i+=4){
+      const gray=0.299*data.data[i]+0.587*data.data[i+1]+0.114*data.data[i+2];
+      // Gentle contrast boost; keep antialiasing rather than hard thresholding
+      const contrast=Math.max(0,Math.min(255,(gray-128)*1.45+128));
+      data.data[i]=data.data[i+1]=data.data[i+2]=contrast;
+    }
+    ctx.putImageData(data,0,0);
+    return canvas;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+ocr.addEventListener("click",async()=>{
+  if(!selectedFile)return;
+  ocr.disabled=true;
+  try{
+    status.textContent="写真を見やすく調整しています…";
+    const image=await prepareImage(selectedFile);
+    status.textContent="文字認識エンジンを準備しています…";
+    const worker=await getOCRWorker();
+    status.textContent="写真を読み取り中…";
+    const {data}=await worker.recognize(image);
+    // この勤務表向け：文字の位置で「出勤」「退勤」「時間数」を分ける。
+    // 左側の出勤欄と中央右側の退勤欄だけを組み合わせ、右端の勤務時間数は除外。
+    const words=(data.words||[]).map(w=>{
+      const text=normalizeText(w.text||"").trim();
+      const m=text.match(/^(\d{1,2})\s*[:.]\s*(\d{2})$/);
+      if(!m) return null;
+      const hh=Number(m[1]), mm=Number(m[2]);
+      if(hh>23||mm>59) return null;
+      return {time:`${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}`,
+        x:(w.bbox.x0+w.bbox.x1)/2/(image.width||1),
+        y:(w.bbox.y0+w.bbox.y1)/2/(image.height||1)};
+    }).filter(Boolean);
+
+    // Layout of the sample sheet: start time at left, end time in the middle-right,
+    // and worked-hours total at far right. Ignore the far-right column.
+    const starts=words.filter(w=>w.x>0.10&&w.x<0.34);
+    const ends=words.filter(w=>w.x>0.48&&w.x<0.79);
+    const usedEnds=new Set();
+    const pairs=[];
+    const dateWords=(data.words||[]).map(w=>{
+      const text=normalizeText(w.text||"").trim();
+      const m=text.match(/^(\d{1,2})$/);
+      if(!m) return null;
+      const day=Number(m[1]);
+      if(day<1||day>31) return null;
+      return {day,y:(w.bbox.y0+w.bbox.y1)/2/(image.height||1),
+        x:(w.bbox.x0+w.bbox.x1)/2/(image.width||1)};
+    }).filter(w=>w&&w.x<0.095);
+    const monthValue=$("#sheetMonth").value;
+    function dateForDay(day){
+      if(!monthValue) return "";
+      const [year,month]=monthValue.split("-").map(Number);
+      const d=new Date(year,month-1,day);
+      if(d.getFullYear()!==year||d.getMonth()!==month-1) return "";
+      return `${year}-${String(month).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
+    }
+    for(const s of starts.sort((a,b)=>a.y-b.y)){
+      let best=-1, dist=Infinity;
+      ends.forEach((e,i)=>{
+        if(usedEnds.has(i)) return;
+        const d=Math.abs(e.y-s.y);
+        if(d<dist){dist=d;best=i;}
+      });
+      let end="";
+      if(best>=0&&dist<0.045){
+        usedEnds.add(best);
+        end=ends[best].time;
+      }
+      let dayBest=null, dayDist=Infinity;
+      dateWords.forEach(d=>{
+        const delta=Math.abs(d.y-s.y);
+        if(delta<dayDist){dayDist=delta;dayBest=d;}
+      });
+      const date=(dayBest&&dayDist<0.035)?dateForDay(dayBest.day):"";
+      pairs.push({y:s.y,start:s.time,end,date});
+    }
+    if(pairs.length===0){
+      // Fallback: show no guessed pairings if layout-aware OCR can't find the columns.
+      status.textContent="出勤欄を認識できませんでした。表全体が写るように撮影し直すか、時刻を手入力してください。";
+      return;
+    }
+    rows.innerHTML="";
+    pairs.sort((a,b)=>a.y-b.y).forEach(p=>addRow(p.start,p.end,p.date||""));
+    const complete=pairs.filter(p=>p.start&&p.end).length;
+    status.textContent=`${pairs.length}行を読み取りました（出勤・退勤がそろった行：${complete}件）。日付は年月設定と左端の日付欄から推定しています。結果を確認してから給料を計算してください。`;
+  }catch(e){
+    status.textContent="読み取りに失敗しました。インターネット接続を確認して、もう一度お試しください。";
+  }finally{
+    ocr.disabled=false;
+  }
+});
+
+$("#add").addEventListener("click",()=>addRow());
+
+function mins(v){const [h,m]=v.split(":").map(Number);return h*60+m}
+function yen(v){return Math.round(v).toLocaleString("ja-JP")+"円"}
+
+$("#calc").addEventListener("click",()=>{
+  const base=Math.max(0,Number($("#base").value)||0);
+  const early=Math.max(0,Number($("#early").value)||0);
+  const weekend=Math.max(0,Number($("#weekend").value)||0);
+  const breakMin=Math.max(0,Number($("#break").value)||0);
+  let total=0,totalMin=0,earlyMin=0,normalMin=0, count=0;
+  const out=[`<h2>④ 計算結果</h2><table><tr><th>日付</th><th>勤務時間</th><th>給料</th></tr>`];
+
+  rows.querySelectorAll(".row").forEach(r=>{
+    const s=r.querySelector(".start").value,e=r.querySelector(".end").value,d=r.querySelector(".date").value;
+    if(!s||!e)return;
+    let a=mins(s),b=mins(e);
+    if(b<a)b+=1440;
+    let work=Math.max(0,b-a-breakMin);
+    // 8:00までの時間を算出
+    const earlyEnd=480+(a>=1440?1440:0);
+    let ep=Math.max(0,Math.min(b,earlyEnd)-a);
+    ep=Math.min(ep,work);
+    const np=work-ep;
+    const day=d?new Date(d+"T12:00:00").getDay():-1;
+    const add=(day===0||day===6)?weekend:0;
+    const pay=ep*(early+add)/60+np*(base+add)/60;
+    total+=pay;totalMin+=work;earlyMin+=ep;normalMin+=np;count++;
+    out.push(`<tr><td>${d||"—"}</td><td>${Math.floor(work/60)}時間${work%60}分</td><td>${yen(pay)}</td></tr>`);
+  });
+  out.push(`</table><p class="result">${total.toLocaleString("ja-JP",{maximumFractionDigits:2})}円</p>
+  <p class="note">勤務日数：${count}日<br>総労働時間：${Math.floor(totalMin/60)}時間${totalMin%60}分<br>
+  8:00前：${Math.floor(earlyMin/60)}時間${earlyMin%60}分 ／ 8:00以降：${Math.floor(normalMin/60)}時間${normalMin%60}分</p>`);
+  const box=$("#result");box.innerHTML=out.join("");box.hidden=false;
+});
+</script>
+</body>
+</html>
